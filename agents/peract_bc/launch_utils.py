@@ -162,6 +162,7 @@ def _add_keypoints_to_replay(
         device = 'cpu'):
     prev_action = None
     obs = inital_obs
+    # print('sadfas', episode_keypoints)
     for k, keypoint in enumerate(episode_keypoints):
         obs_tp1 = demo[keypoint]
         obs_tm1 = demo[max(0, keypoint - 1)]

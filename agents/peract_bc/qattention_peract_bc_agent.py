@@ -93,6 +93,10 @@ class QFunction(nn.Module):
         if bounds.shape[0] != b:
             bounds = bounds.repeat(b, 1)
 
+        print('voxel_grid', voxel_grid.shape)
+        print('proprio', proprio)
+        print('prev_layer_voxel_grid', prev_layer_voxel_grid)
+
         # forward pass
         q_trans, \
         q_rot_and_grip,\
@@ -407,6 +411,15 @@ class QAttentionPerActBCAgent(Agent):
                                          self._device)
 
         # forward pass
+
+        # print('obs', obs)
+        # print('proprio', proprio)
+        # print('pcd', pcd.shape)
+        # print('lang_goal_emb', lang_goal_emb.shape)
+        # print('lang_token_embs', lang_token_embs.shape)
+        # print('bounds', bounds)
+        # print('prev_layer_bounds', prev_layer_bounds)
+        # print('prev_layer_voxel_grid', prev_layer_voxel_grid.shape)
         q_trans, q_rot_grip, \
         q_collision, \
         voxel_grid = self._q(obs,
@@ -417,6 +430,11 @@ class QAttentionPerActBCAgent(Agent):
                              bounds,
                              prev_layer_bounds,
                              prev_layer_voxel_grid)
+
+        print('q_trans', q_trans.shape)
+        print('q_rot_grip', q_rot_grip.shape)
+        print('q_collision', q_collision.shape)
+        print('voxel_grid', voxel_grid.shape)
 
         # argmax to choose best action
         coords, \
