@@ -11,9 +11,10 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Reduce
+from einops.layers.torch import Rearrange, Reduce
 
 from helpers.network_utils import DenseBlock, SpatialSoftmax3D, Conv3DBlock, Conv3DUpsampleBlock
-
+import math
 # helpers
 
 def exists(val):
@@ -132,6 +133,36 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 
+# positional embedding
+
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device = x.device) * -emb)
+        emb = rearrange(x, 'i -> i 1') * rearrange(emb, 'j -> 1 j')
+        return torch.cat((emb.sin(), emb.cos()), dim = -1)
+
+class LearnedSinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        assert (dim % 2) == 0
+        half_dim = dim // 2
+        self.weights = nn.Parameter(torch.randn(half_dim))
+
+    def forward(self, x):
+        # print('a', x)
+        x = rearrange(x, 'b -> b 1')
+        freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * math.pi
+        fouriered = torch.cat((freqs.sin(), freqs.cos()), dim = -1)
+        fouriered = torch.cat((x, fouriered), dim = -1)
+        return fouriered
+
+
 # PerceiverIO adapted for 6-DoF manipulation
 class PerceiverVoxelLangEncoder(nn.Module):
     def __init__(
@@ -203,7 +234,7 @@ class PerceiverVoxelLangEncoder(nn.Module):
         # learnable positional encoding
         if self.pos_encoding_with_lang:
             self.pos_encoding = nn.Parameter(torch.randn(1,
-                                                         lang_max_seq_len + spatial_size ** 3,
+                                                         lang_max_seq_len + spatial_size ** 3 + 3,
                                                          self.input_dim_before_seq))
         else:
             # assert self.lang_fusion_type == 'concat', 'Only concat is supported for pos encoding without lang.'
@@ -304,7 +335,12 @@ class PerceiverVoxelLangEncoder(nn.Module):
             strides=1, norm=None, activation=activation)
 
         self.trans_decoder = Conv3DBlock(
-            self.final_dim, 1, kernel_sizes=3, strides=1,
+            self.final_dim, 10, kernel_sizes=3, strides=1,
+            norm=None, activation=None,
+        )
+
+        self.trans_decoder1 = Conv3DBlock(
+            10, 1, kernel_sizes=3, strides=1,
             norm=None, activation=None,
         )
 
@@ -325,6 +361,31 @@ class PerceiverVoxelLangEncoder(nn.Module):
                                                     self.num_collision_classes,
                                                     None, None)
 
+        learned_sinu_pos_emb_dim = 16
+        sinu_pos_emb = LearnedSinusoidalPosEmb(learned_sinu_pos_emb_dim)
+        sinu_pos_emb_input_dim = learned_sinu_pos_emb_dim + 1
+        time_cond_dim = 512
+        cond_dim = 128
+        num_time_tokens = 3
+
+        self.to_time_hiddens = nn.Sequential(
+            sinu_pos_emb,
+            nn.Linear(sinu_pos_emb_input_dim, time_cond_dim),
+            nn.SiLU()
+        )
+
+        self.to_time_cond = nn.Sequential(
+            nn.Linear(time_cond_dim, time_cond_dim)
+        )
+
+        # project to time tokens as well as time hiddens
+
+        self.to_time_tokens = nn.Sequential(
+            nn.Linear(time_cond_dim, cond_dim * num_time_tokens),
+            Rearrange('b (r d) -> b r d', r = num_time_tokens)
+        )
+
+
     def encode_text(self, x):
         with torch.no_grad():
             text_feat, text_emb = self._clip_rn50.encode_text_with_embeddings(x)
@@ -334,9 +395,54 @@ class PerceiverVoxelLangEncoder(nn.Module):
         text_mask = torch.where(x==0, x, 1)  # [1, max_token_len]
         return text_feat, text_emb
 
+    # derived preconditioning params - Table 1
+
+    def c_skip(self, sigma_data, sigma):
+        return (sigma_data ** 2) / (sigma ** 2 + sigma_data ** 2)
+
+    def c_out(self, sigma_data, sigma):
+        return sigma * sigma_data * (sigma_data ** 2 + sigma ** 2) ** -0.5
+
+    def c_in(self, sigma_data, sigma):
+        return 1 * (sigma ** 2 + sigma_data ** 2) ** -0.5
+
+    def log(self, t, eps = 1e-20):
+        return torch.log(t.clamp(min = eps))
+
+    def c_noise(self, sigma):
+        return self.log(sigma) * 0.25
+
+    # learned_sinu_pos_emb_dim = 16
+    # sinu_pos_emb = LearnedSinusoidalPosEmb(learned_sinu_pos_emb_dim)
+    # sinu_pos_emb_input_dim = learned_sinu_pos_emb_dim + 1
+    # time_cond_dim = 512
+    # cond_dim = 128
+    # num_time_tokens = 2
+
+    # self.to_time_hiddens = nn.Sequential(
+    #     sinu_pos_emb,
+    #     nn.Linear(sinu_pos_emb_input_dim, time_cond_dim),
+    #     nn.SiLU()
+    # )
+
+    # self.to_time_cond = nn.Sequential(
+    #     nn.Linear(time_cond_dim, time_cond_dim)
+    # )
+
+    # # project to time tokens as well as time hiddens
+
+    # self.to_time_tokens = nn.Sequential(
+    #     nn.Linear(time_cond_dim, cond_dim * num_time_tokens),
+    #     Rearrange('b (r d) -> b r d', r = num_time_tokens)
+    # )
+
     def forward(
             self,
-            ins,
+            voxel_grid,
+            noised_voxels,
+            sigma,
+            sigma_data,
+            padded_sigma,
             proprio,
             lang_goal_emb,
             lang_token_embs,
@@ -346,7 +452,25 @@ class PerceiverVoxelLangEncoder(nn.Module):
             mask=None,
     ):
         # preprocess input
-        d0 = self.input_preprocess(ins)                       # [B,10,100,100,100] -> [B,64,100,100,100]
+
+        in_voxels = self.c_in(sigma_data, padded_sigma) * noised_voxels
+        in_sigma = self.c_noise(sigma)
+        # in_voxel (B, 10, 100, 100, 100)
+        ins = torch.cat((in_voxels, voxel_grid), dim = 1)
+
+        d0 = self.input_preprocess(ins)                       # [B,20,100,100,100] -> [B,64,100,100,100]
+
+        # time conditioning
+
+        time_hiddens = self.to_time_hiddens(in_sigma)
+
+        # derive time tokens
+
+        time_tokens = self.to_time_tokens(time_hiddens)
+        # t = self.to_time_cond(time_hiddens)
+        # token (B, 2, 128)
+        # t (B, 512)
+
 
         # aggregated features from 1st softmax and maxpool for MLP decoders
         feats = [self.ss0(d0.contiguous()), self.global_maxp(d0).view(ins.shape[0], -1)]
@@ -407,7 +531,8 @@ class PerceiverVoxelLangEncoder(nn.Module):
         # option 2: add lang token embs as a sequence
         if self.lang_fusion_type == 'seq':
             l = self.lang_preprocess(lang_token_embs)         # [B,77,1024] -> [B,77,128]
-            ins = torch.cat((l, ins), dim=1)                  # [B,8077,128]
+            l = torch.cat((l, time_tokens), dim=1) # [B,79,128]
+            ins = torch.cat((l, ins), dim=1)                  # [B,8079,128]
 
         # add pos encoding to language + flattened grid (the recommended way)
         if self.pos_encoding_with_lang:
@@ -453,9 +578,10 @@ class PerceiverVoxelLangEncoder(nn.Module):
         else:
             u = self.final(torch.cat([d0, u0], dim=1))
 
-        # print('uu', u.shape)
         # translation decoder
-        trans = self.trans_decoder(u)
+        trans = self.trans_decoder(u) # (b, 10, 100, 100, 100)
+        trans = self.c_skip(sigma_data, padded_sigma) * noised_voxels +  self.c_out(sigma_data, padded_sigma) * trans
+        trans = self.trans_decoder1(trans) # (b, 1, 100, 100, 100)
 
         # rotation, gripper, and collision MLPs
         rot_and_grip_out = None

@@ -26,6 +26,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 NAME = 'QAttentionAgent'
 
+from functools import partial
+from einops import rearrange, repeat, reduce
 
 class QFunction(nn.Module):
 
@@ -41,10 +43,13 @@ class QFunction(nn.Module):
         self._voxelizer = voxelizer
         self._bounds_offset = bounds_offset
         self._qnet = perceiver_encoder.to(device)
+        self.device = device
 
         # distributed training
         if training:
-            self._qnet = DDP(self._qnet, device_ids=[device])
+            self._qnet = DDP(self._qnet, device_ids=[device], find_unused_parameters=True)
+
+        self.right_pad_dims_to_datatype = partial(rearrange, pattern = ('b -> b 1 1 1 1'))
 
     def _argmax_3d(self, tensor_orig):
         b, c, d, h, w = tensor_orig.shape  # c will be one
@@ -69,7 +74,12 @@ class QFunction(nn.Module):
             ignore_collision = q_collision[:, -2:].argmax(-1, keepdim=True)
         return coords, rot_and_grip_indicies, ignore_collision
 
-    def forward(self, rgb_pcd, proprio, pcd, lang_goal_emb, lang_token_embs,
+    def noise_distribution(self, P_mean, P_std, batch_size):
+        return (P_mean + P_std * torch.randn((batch_size,), device = self.device)).exp()
+    
+    # self.right_pad_dims_to_datatype = partial(rearrange, pattern = ('b -> b 1 1 1 1'))
+
+    def forward(self, action_trans_one_hot, rgb_pcd, proprio, pcd, lang_goal_emb, lang_token_embs,
                 bounds=None, prev_bounds=None, prev_layer_voxel_grid=None):
         # rgb_pcd will be list of list (list of [rgb, pcd])
         b = rgb_pcd[0][0].shape[0]
@@ -101,10 +111,49 @@ class QFunction(nn.Module):
         # print('bounds', bounds) (-0.3, -0.5, 0.6, 0.7, 0.5, 1.6)
         # print('prev_bounds', prev_bounds)
 
+
+        batch_size = voxel_grid.shape[0]
+        sigma_min = 0.002                          # min noise level
+        sigma_max = 80                             # max noise level
+        sigma_data = 0.5                           # standard deviation of data distribution
+        rho = 7                                    # controls the sampling schedule
+        P_mean = -1.2                              # mean of log-normal distribution from which noise is drawn for training
+        P_std = 1.2                                # standard deviation of log-normal distribution from which noise is drawn for training
+        S_churn = 80                               # parameters for stochastic sampling - depends on dataset, Table 5 in apper
+        S_tmin = 0.05
+        S_tmax = 50
+        S_noise = 1.003
+
+        # get the sigmas
+
+        sigmas = self.noise_distribution(P_mean, P_std, batch_size)
+        padded_sigmas = self.right_pad_dims_to_datatype(sigmas)
+
+        # noise
+        label_noise = torch.cat([action_trans_one_hot] * 10, dim=1)
+
+        noise = torch.randn_like(voxel_grid)
+        noised_voxels = label_noise + padded_sigmas * noise  # alphas are 1. in the paper
+
+        # print(sigmas)
+        # if isinstance(sigmas, float):
+        #     sigma = torch.full((batch_size,), sigmas, device = device)
+
+        padded_sigma = self.right_pad_dims_to_datatype(sigmas)
+
+        # in_voxels = self.c_in(sigma_data, padded_sigma) * noised_voxels
+        # in_sigma = self.c_noise(sigma)
+
+        # out = self.c_skip(sigma_data, padded_sigma) * noised_images +  self.c_out(sigma_data, padded_sigma) * net_out
+
         # forward pass
         q_trans, \
         q_rot_and_grip,\
         q_ignore_collisions = self._qnet(voxel_grid, 
+                                         noised_voxels,
+                                         sigmas,
+                                         sigma_data,
+                                         padded_sigma,
                                          proprio,
                                          lang_goal_emb, 
                                          lang_token_embs,
@@ -112,7 +161,7 @@ class QFunction(nn.Module):
                                          bounds, 
                                          prev_bounds)
 
-        return q_trans, q_rot_and_grip, q_ignore_collisions, voxel_grid
+        return q_trans, q_rot_and_grip, q_ignore_collisions, voxel_grid, sigmas, sigma_data
 
 
 class QAttentionPerActBCAgent(Agent):
@@ -372,7 +421,11 @@ class QAttentionPerActBCAgent(Agent):
         q_collision_softmax = F.softmax(q_collision, dim=1)
         return q_collision_softmax
 
+    def loss_weight(self, sigma_data, sigma):
+        return (sigma ** 2 + sigma_data ** 2) * (sigma * sigma_data) ** -2
+
     def update(self, step: int, replay_sample: dict) -> dict:
+
         action_trans = replay_sample['trans_action_indicies'][:, self._layer * 3:self._layer * 3 + 3].int()
         action_rot_grip = replay_sample['rot_grip_action_indicies'].int()
         action_gripper_pose = replay_sample['gripper_pose']
@@ -414,6 +467,7 @@ class QAttentionPerActBCAgent(Agent):
                                          self._rotation_resolution,
                                          self._device)
 
+
         # forward pass
 
         # print('obs', obs)
@@ -424,9 +478,16 @@ class QAttentionPerActBCAgent(Agent):
         # print('bounds', bounds)
         # print('prev_layer_bounds', prev_layer_bounds)
         # print('prev_layer_voxel_grid', prev_layer_voxel_grid.shape)
+
+        # translation one-hot
+        action_trans_one_hot = self._action_trans_one_hot_zeros.clone()
+        for b in range(bs):
+            gt_coord = action_trans[b, :].int()
+            action_trans_one_hot[b, :, gt_coord[0], gt_coord[1], gt_coord[2]] = 1
+
         q_trans, q_rot_grip, \
         q_collision, \
-        voxel_grid = self._q(obs,
+        voxel_grid, sigmas, sigma_data = self._q(action_trans_one_hot, obs,
                              proprio,
                              pcd,
                              lang_goal_emb,
@@ -447,7 +508,7 @@ class QAttentionPerActBCAgent(Agent):
 
         q_trans_loss, q_rot_loss, q_grip_loss, q_collision_loss = 0., 0., 0., 0.
 
-        # translation one-hot
+        # # translation one-hot
         action_trans_one_hot = self._action_trans_one_hot_zeros.clone()
         for b in range(bs):
             gt_coord = action_trans[b, :].int()
@@ -495,10 +556,20 @@ class QAttentionPerActBCAgent(Agent):
             # collision loss
             q_collision_loss += self._celoss(q_ignore_collisions_flat, action_ignore_collisions_one_hot)
 
+        # print('aaaa', self.loss_weight(sigma_data, sigmas))
+        q_trans_loss = q_trans_loss #* self.loss_weight(sigma_data, sigmas)
+        # q_rot_loss = q_rot_loss * self.loss_weight(sigma_data, sigmas)
+        # q_grip_loss = q_grip_loss * self.loss_weight(sigma_data, sigmas)
+        # q_collision_loss = q_collision_loss * self.loss_weight(sigma_data, sigmas)
+
         combined_losses = (q_trans_loss * self._trans_loss_weight) + \
                           (q_rot_loss * self._rot_loss_weight) + \
                           (q_grip_loss * self._grip_loss_weight) + \
                           (q_collision_loss * self._collision_loss_weight)
+
+        # print('q', q_trans_loss * self._trans_loss_weight)
+        # print('com', combined_losses)
+
         total_loss = combined_losses.mean()
 
         self._optimizer.zero_grad()
@@ -634,31 +705,32 @@ class QAttentionPerActBCAgent(Agent):
                          info=info)
 
     def update_summaries(self) -> List[Summary]:
-        summaries = [
-            ImageSummary('%s/update_qattention' % self._name,
-                         transforms.ToTensor()(visualise_voxel(
-                             self._vis_voxel_grid.detach().cpu().numpy(),
-                             self._vis_translation_qvalue.detach().cpu().numpy(),
-                             self._vis_max_coordinate.detach().cpu().numpy(),
-                             self._vis_gt_coordinate.detach().cpu().numpy())))
-        ]
+        # summaries = [
+        #     ImageSummary('%s/update_qattention' % self._name,
+        #                  transforms.ToTensor()(visualise_voxel(
+        #                      self._vis_voxel_grid.detach().cpu().numpy(),
+        #                      self._vis_translation_qvalue.detach().cpu().numpy(),
+        #                      self._vis_max_coordinate.detach().cpu().numpy(),
+        #                      self._vis_gt_coordinate.detach().cpu().numpy())))
+        # ]
+        summaries = []
 
         for n, v in self._summaries.items():
             summaries.append(ScalarSummary('%s/%s' % (self._name, n), v))
 
-        for (name, crop) in (self._crop_summary):
-            crops = (torch.cat(torch.split(crop, 3, dim=1), dim=3) + 1.0) / 2.0
-            summaries.extend([
-                ImageSummary('%s/crops/%s' % (self._name, name), crops)])
+        # for (name, crop) in (self._crop_summary):
+        #     crops = (torch.cat(torch.split(crop, 3, dim=1), dim=3) + 1.0) / 2.0
+        #     summaries.extend([
+        #         ImageSummary('%s/crops/%s' % (self._name, name), crops)])
 
-        for tag, param in self._q.named_parameters():
-            # assert not torch.isnan(param.grad.abs() <= 1.0).all()
-            summaries.append(
-                HistogramSummary('%s/gradient/%s' % (self._name, tag),
-                                 param.grad))
-            summaries.append(
-                HistogramSummary('%s/weight/%s' % (self._name, tag),
-                                 param.data))
+        # for tag, param in self._q.named_parameters():
+        #     # assert not torch.isnan(param.grad.abs() <= 1.0).all()
+        #     summaries.append(
+        #         HistogramSummary('%s/gradient/%s' % (self._name, tag),
+        #                          param.grad))
+        #     summaries.append(
+        #         HistogramSummary('%s/weight/%s' % (self._name, tag),
+        #                          param.data))
 
         return summaries
 

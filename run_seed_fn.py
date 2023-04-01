@@ -21,7 +21,7 @@ from agents import c2farm_lingunet_bc
 from agents import peract_bc
 from agents import arm
 from agents.baselines import bc_lang, vit_bc_lang
-
+from agents import peract_diffusion
 
 def run_seed(rank,
              cfg: DictConfig,
@@ -122,6 +122,26 @@ def run_seed(rank,
             keypoint_method=cfg.method.keypoint_method)
 
         agent = peract_bc.launch_utils.create_agent(cfg)
+
+    elif cfg.method.name == 'PERACT_DIFFUSION':
+        replay_buffer = peract_diffusion.launch_utils.create_replay(
+            cfg.replay.batch_size, cfg.replay.timesteps,
+            cfg.replay.prioritisation,
+            cfg.replay.task_uniform,
+            replay_path if cfg.replay.use_disk else None,
+            cams, cfg.method.voxel_sizes,
+            cfg.rlbench.camera_resolution)
+
+        peract_diffusion.launch_utils.fill_multi_task_replay(
+            cfg, obs_config, rank,
+            replay_buffer, tasks, cfg.rlbench.demos,
+            cfg.method.demo_augmentation, cfg.method.demo_augmentation_every_n,
+            cams, cfg.rlbench.scene_bounds,
+            cfg.method.voxel_sizes, cfg.method.bounds_offset,
+            cfg.method.rotation_resolution, cfg.method.crop_augmentation,
+            keypoint_method=cfg.method.keypoint_method)
+
+        agent = peract_diffusion.launch_utils.create_agent(cfg)
 
     elif cfg.method.name == 'PERACT_RL':
         raise NotImplementedError("PERACT_RL is not supported yet")

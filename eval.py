@@ -24,6 +24,7 @@ from agents import c2farm_lingunet_bc
 from agents import peract_bc
 from agents import arm
 from agents.baselines import bc_lang, vit_bc_lang
+from agents import peract_diffusion
 
 from helpers.custom_rlbench_env import CustomRLBenchEnv, CustomMultiTaskRLBenchEnv
 from helpers import utils
@@ -73,6 +74,9 @@ def eval_seed(train_cfg,
 
     elif train_cfg.method.name == 'PERACT_BC':
         agent = peract_bc.launch_utils.create_agent(train_cfg)
+
+    elif train_cfg.method.name == 'PERACT_DIFFUSION':
+        agent = peract_diffusion.launch_utils.create_agent(train_cfg)
 
     elif train_cfg.method.name == 'PERACT_RL':
         raise NotImplementedError("PERACT_RL not yet supported for eval.py")
